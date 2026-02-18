@@ -158,14 +158,55 @@ router.delete('/users/:id', authRequired, requirePermissions(['users.manage']), 
   }
 });
 
-// Admin: list roles
+// Admin: list roles with their permissions
 router.get('/roles', authRequired, requirePermissions(['roles.manage']), async (req, res) => {
   try {
     const rolesRes = await pool.query('SELECT id, name FROM roles ORDER BY name ASC');
-    res.json(rolesRes.rows || []);
+    const roles = rolesRes.rows || [];
+
+    const permsRes = await pool.query(
+      `SELECT rp.role_id, p.id, p.code, p.description
+       FROM role_permissions rp
+       JOIN permissions p ON p.id = rp.permission_id
+       ORDER BY p.code ASC`
+    );
+    const permsByRole = {};
+    permsRes.rows.forEach(p => {
+      if (!permsByRole[p.role_id]) permsByRole[p.role_id] = [];
+      permsByRole[p.role_id].push({ id: p.id, code: p.code, description: p.description });
+    });
+
+    res.json(roles.map(r => ({ ...r, permissions: permsByRole[r.id] || [] })));
   } catch (err) {
     console.error('List roles error', err);
     res.status(500).json({ error: 'Failed to list roles' });
+  }
+});
+
+// Admin: get single role with its permissions
+router.get('/roles/:id', authRequired, requirePermissions(['roles.manage']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const roleRes = await pool.query('SELECT id, name FROM roles WHERE id = $1', [id]);
+    const role = roleRes.rows[0];
+    if (!role) return res.status(404).json({ error: 'Role not found' });
+
+    const permsRes = await pool.query(
+      `SELECT p.id, p.code, p.description
+       FROM role_permissions rp
+       JOIN permissions p ON p.id = rp.permission_id
+       WHERE rp.role_id = $1
+       ORDER BY p.code ASC`,
+      [id]
+    );
+
+    res.json({
+      ...role,
+      permissions: permsRes.rows || []
+    });
+  } catch (err) {
+    console.error('Get role error', err);
+    res.status(500).json({ error: 'Failed to get role' });
   }
 });
 
@@ -179,6 +220,20 @@ router.post('/roles', authRequired, requirePermissions(['roles.manage']), async 
   } catch (err) {
     console.error('Create role error', err);
     res.status(500).json({ error: 'Failed to create role' });
+  }
+});
+
+// Admin: delete role
+router.delete('/roles/:id', authRequired, requirePermissions(['roles.manage']), async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM role_permissions WHERE role_id = $1', [id]);
+    await pool.query('DELETE FROM user_roles WHERE role_id = $1', [id]);
+    await pool.query('DELETE FROM roles WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete role error', err);
+    res.status(500).json({ error: 'Failed to delete role' });
   }
 });
 

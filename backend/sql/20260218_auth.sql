@@ -44,9 +44,13 @@ INSERT INTO public.permissions (code, description) VALUES
   ('orders.production', 'Production actions'),
   ('orders.download', 'Download PDFs'),
   ('products.read', 'Read products'),
-  ('products.write', 'Manage products'),
+  ('products.create', 'Create products'),
+  ('products.update', 'Update products'),
+  ('products.delete', 'Delete products'),
   ('clients.read', 'Read clients'),
-  ('clients.write', 'Manage clients'),
+  ('clients.create', 'Create clients'),
+  ('clients.update', 'Update clients'),
+  ('clients.delete', 'Delete clients'),
   ('inventory.read', 'Read inventory'),
   ('users.manage', 'Manage users'),
   ('roles.manage', 'Manage roles'),
@@ -77,13 +81,13 @@ JOIN public.permissions p ON p.code NOT IN ('users.manage','roles.manage','permi
 WHERE r.name = 'production'
 ON CONFLICT DO NOTHING;
 
--- Commercial: read + manage orders (no validate/finish/production), read products/clients/inventory
+-- Commercial: read + manage orders (no validate/finish/production), read products/clients/inventory, can manage clients
 INSERT INTO public.role_permissions (role_id, permission_id)
 SELECT r.id, p.id
 FROM public.roles r
 JOIN public.permissions p ON p.code IN (
   'orders.read','orders.create','orders.update','orders.delete','orders.download',
-  'products.read','clients.read','inventory.read'
+  'products.read','clients.read','clients.create','clients.update','clients.delete','inventory.read'
 )
 WHERE r.name = 'commercial'
 ON CONFLICT DO NOTHING;

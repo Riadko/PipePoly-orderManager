@@ -55,8 +55,57 @@ router.post('/', authRequired, requirePermissions(['products.create']), upload.f
   }
 });
 
-// Stream binary file endpoints
-router.get('/:id/image', authRequired, requirePermissions(['products.read']), async (req, res) => {
+// Update product
+router.put('/:id', authRequired, requirePermissions(['products.update']), upload.fields([
+  { name: 'image', maxCount: 1 },
+  { name: 'drawing', maxCount: 1 },
+  { name: 'spec', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description } = req.body;
+
+    // Get current product to preserve existing files if not updating
+    const currentRes = await pool.query('SELECT * FROM catalog_products WHERE id = $1', [id]);
+    const current = currentRes.rows[0];
+    if (!current) return res.status(404).json({ error: 'Product not found' });
+
+    const imageFile = req.files?.image?.[0] || null;
+    const drawingFile = req.files?.drawing?.[0] || null;
+    const specFile = req.files?.spec?.[0] || null;
+
+    const result = await pool.query(
+      `UPDATE catalog_products SET
+        name = $1,
+        description = $2,
+        image_filename = COALESCE($3, image_filename),
+        image_data = COALESCE($4, image_data),
+        drawing_filename = COALESCE($5, drawing_filename),
+        drawing_data = COALESCE($6, drawing_data),
+        spec_filename = COALESCE($7, spec_filename),
+        spec_data = COALESCE($8, spec_data)
+       WHERE id = $9 RETURNING *`,
+      [
+        name || current.name,
+        description || current.description,
+        imageFile ? imageFile.originalname : null,
+        imageFile ? imageFile.buffer : null,
+        drawingFile ? drawingFile.originalname : null,
+        drawingFile ? drawingFile.buffer : null,
+        specFile ? specFile.originalname : null,
+        specFile ? specFile.buffer : null,
+        id
+      ]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating catalog product', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// File serving endpoints - no auth required for reading product files (they're public once created)
+router.get('/:id/image', async (req, res) => {
   try {
     const { id } = req.params;
     const r = await pool.query('SELECT image_filename, image_data FROM catalog_products WHERE id = $1', [id]);
@@ -74,7 +123,7 @@ router.get('/:id/image', authRequired, requirePermissions(['products.read']), as
   }
 });
 
-router.get('/:id/drawing', authRequired, requirePermissions(['products.read']), async (req, res) => {
+router.get('/:id/drawing', async (req, res) => {
   try {
     const { id } = req.params;
     const r = await pool.query('SELECT drawing_filename, drawing_data FROM catalog_products WHERE id = $1', [id]);
@@ -92,7 +141,7 @@ router.get('/:id/drawing', authRequired, requirePermissions(['products.read']), 
   }
 });
 
-router.get('/:id/spec', authRequired, requirePermissions(['products.read']), async (req, res) => {
+router.get('/:id/spec', async (req, res) => {
   try {
     const { id } = req.params;
     const r = await pool.query('SELECT spec_filename, spec_data FROM catalog_products WHERE id = $1', [id]);
