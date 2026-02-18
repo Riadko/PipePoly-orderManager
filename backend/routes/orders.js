@@ -12,6 +12,7 @@ const Inventory = require('../models/inventoryModel');
 // inventory_segments removed from simplified workflow
 const StockMovement = require('../models/stockMovementModel');
 const { getAllOrders, getOrdersByStatus, addOrder, validateOrder, finishOrder } = require('../models/orderModel');
+const { logAudit, getAuditContext } = require('../utils/audit');
 
 // Multer for multipart handling (files in memory)
 const multer = require('multer');
@@ -668,6 +669,14 @@ router.put('/:id/production', authRequired, requirePermissions(['orders.update']
         // Ici, on ne touche pas au champ status (urgent/normal/can wait),
         // le workflow Kanban reste géré par les booléens validated et finished.
 
+        await logAudit({
+            action: 'orders.production',
+            entityType: 'order',
+            entityId: order.id,
+            metadata: { order_number: order.order_number },
+            ...getAuditContext(req)
+        });
+
         res.json({ message: 'Stock déduit, commande en production.' });
     } catch (err) {
         console.error('Erreur production:', err);
@@ -850,10 +859,23 @@ router.post('/', authRequired, requirePermissions(['orders.create']), upload.any
      const itemsRes = await pool.query('SELECT * FROM order_items WHERE order_id = $1', [newOrder.id]);
      newOrder.items = itemsRes.rows;
 
-     // Send the confirmation email (including items summary)
-     await sendOrderEmail({ ...newOrder, items });
+         // Send the confirmation email (including items summary)
+         await sendOrderEmail({ ...newOrder, items });
 
-     res.status(201).json(newOrder);
+         await logAudit({
+             action: 'orders.create',
+             entityType: 'order',
+             entityId: newOrder.id,
+             metadata: {
+                 order_number: newOrder.order_number,
+                 client_name: newOrder.client_name,
+                 items_count: Array.isArray(items) ? items.length : 0,
+                 total_quantity: newOrder.quantity
+             },
+             ...getAuditContext(req)
+         });
+
+         res.status(201).json(newOrder);
   } catch (error) {
     console.error("Error adding order:", error.message);
     res.status(500).send(error.message);
@@ -925,9 +947,23 @@ router.put('/:id', authRequired, requirePermissions(['orders.update']), upload.a
       console.error('Failed to regenerate PDF after order update', e);
     }
 
-    // respond with rows as items (API compatibility)
-    updated.items = itemsRows;
-    res.json(updated);
+        // respond with rows as items (API compatibility)
+        updated.items = itemsRows;
+
+        await logAudit({
+            action: 'orders.update',
+            entityType: 'order',
+            entityId: id,
+            metadata: {
+                order_number: updated.order_number,
+                client_name: updated.client_name,
+                items_count: itemsRows.length,
+                total_quantity: updated.quantity
+            },
+            ...getAuditContext(req)
+        });
+
+        res.json(updated);
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Error updating order:', err);
@@ -1068,6 +1104,19 @@ router.put("/:id/validate", authRequired, requirePermissions(['orders.validate']
             console.error('Failed to regenerate PDF after validation:', pdfErr);
         }
 
+        await logAudit({
+            action: 'orders.validate',
+            entityType: 'order',
+            entityId: id,
+            metadata: {
+                order_number: updatedOrder.order_number,
+                worker: worker || null,
+                machine: machine || null,
+                delivery_date: providedDD || null
+            },
+            ...getAuditContext(req)
+        });
+
         res.json(updatedOrder);
     } catch (err) {
         await client.query('ROLLBACK');
@@ -1088,6 +1137,14 @@ router.put('/:id/finish', authRequired, requirePermissions(['orders.finish']), a
             "UPDATE orders SET finished = true, finished_date = $1 WHERE id = $2 RETURNING *",
             [finishedDate, id]
         );
+
+        await logAudit({
+            action: 'orders.finish',
+            entityType: 'order',
+            entityId: id,
+            metadata: { order_number: result.rows[0]?.order_number || null },
+            ...getAuditContext(req)
+        });
 
         res.json(result.rows[0]); // Send the updated order back
     } catch (error) {
@@ -1262,6 +1319,19 @@ router.post('/:id/finish-report', authRequired, requirePermissions(['orders.fini
         }
 
         // Return usage details to UI
+        await logAudit({
+            action: 'orders.finish_report',
+            entityType: 'order',
+            entityId: id,
+            metadata: {
+                order_number: order.order_number,
+                used_original: originalUsed,
+                used_entered: usedEntered,
+                used_diff: (usedEntered !== null && !Number.isNaN(usedEntered)) ? (usedEntered - originalUsed) : 0
+            },
+            ...getAuditContext(req)
+        });
+
         return res.json({
             order: upd.rows[0],
             usage: {
@@ -1292,6 +1362,15 @@ router.delete('/:id', authRequired, requirePermissions(['orders.delete']), async
             return res.status(404).json({ error: 'Order not found' });
         }
         await client.query('COMMIT');
+
+        await logAudit({
+            action: 'orders.delete',
+            entityType: 'order',
+            entityId: id,
+            metadata: { order_number: delRes.rows[0]?.order_number || null },
+            ...getAuditContext(req)
+        });
+
         res.json({ message: 'Order deleted', order: delRes.rows[0] });
     } catch (err) {
         await client.query('ROLLBACK');

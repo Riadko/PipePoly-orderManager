@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const pool = require('../config/db');
 const { authRequired, requirePermissions, signToken, getUserAuth } = require('../middleware/auth');
+const { logAudit, getAuditContext } = require('../utils/audit');
 
 const router = express.Router();
 
@@ -9,17 +10,61 @@ const router = express.Router();
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    if (!email || !password) {
+      await logAudit({
+        action: 'auth.login.failed',
+        entityType: 'auth',
+        metadata: { reason: 'missing_credentials', email: email || null },
+        ...getAuditContext(req)
+      });
+      return res.status(400).json({ error: 'email and password required' });
+    }
 
     const userRes = await pool.query('SELECT * FROM users WHERE email = $1', [String(email).toLowerCase()]);
     const user = userRes.rows[0];
-    if (!user || user.is_active === false) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!user || user.is_active === false) {
+      await logAudit({
+        action: 'auth.login.failed',
+        entityType: 'auth',
+        metadata: { reason: 'invalid_credentials', email: String(email).toLowerCase() },
+        ...getAuditContext(req)
+      });
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     const ok = await bcrypt.compare(String(password), user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!ok) {
+      await logAudit({
+        action: 'auth.login.failed',
+        entityType: 'auth',
+        metadata: { reason: 'invalid_credentials', email: String(email).toLowerCase() },
+        ...getAuditContext(req)
+      });
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
     const authInfo = await getUserAuth(user.id);
-    if (!authInfo) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!authInfo) {
+      await logAudit({
+        action: 'auth.login.failed',
+        entityType: 'auth',
+        metadata: { reason: 'invalid_credentials', email: String(email).toLowerCase() },
+        ...getAuditContext(req)
+      });
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    await logAudit({
+      action: 'auth.login.success',
+      entityType: 'user',
+      entityId: user.id,
+      actorUserId: user.id,
+      actorEmail: authInfo.user.email,
+      actorRoles: authInfo.roles,
+      ipAddress: req.ip || null,
+      userAgent: req.get('user-agent') || null,
+      metadata: { email: authInfo.user.email }
+    });
 
     const token = signToken({ sub: user.id });
     res.json({
@@ -245,6 +290,85 @@ router.get('/permissions', authRequired, requirePermissions(['permissions.manage
   } catch (err) {
     console.error('List permissions error', err);
     res.status(500).json({ error: 'Failed to list permissions' });
+  }
+});
+
+// Admin: list audit logs
+router.get('/audit-logs', authRequired, requirePermissions(['permissions.manage']), async (req, res) => {
+  try {
+    const {
+      action,
+      entity_type,
+      entity_id,
+      actor_email,
+      from,
+      to,
+      limit,
+      offset
+    } = req.query || {};
+
+    const clauses = [];
+    const params = [];
+
+    if (action) {
+      params.push(`%${String(action)}%`);
+      clauses.push(`action ILIKE $${params.length}`);
+    }
+    if (entity_type) {
+      params.push(`%${String(entity_type)}%`);
+      clauses.push(`entity_type ILIKE $${params.length}`);
+    }
+    if (entity_id) {
+      params.push(`%${String(entity_id)}%`);
+      clauses.push(`entity_id ILIKE $${params.length}`);
+    }
+    if (actor_email) {
+      params.push(`%${String(actor_email).toLowerCase()}%`);
+      clauses.push(`LOWER(actor_email) ILIKE $${params.length}`);
+    }
+
+    const fromDate = from ? new Date(from) : null;
+    if (fromDate && !Number.isNaN(fromDate.getTime())) {
+      params.push(fromDate);
+      clauses.push(`created_at >= $${params.length}`);
+    }
+
+    const toDate = to ? new Date(to) : null;
+    if (toDate && !Number.isNaN(toDate.getTime())) {
+      params.push(toDate);
+      clauses.push(`created_at <= $${params.length}`);
+    }
+
+    const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 200);
+    const safeOffset = Math.max(parseInt(offset, 10) || 0, 0);
+
+    const countRes = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM audit_logs ${whereSql}`,
+      params
+    );
+
+    const listSql = `
+      SELECT id, action, entity_type, entity_id, actor_user_id, actor_email, actor_roles,
+             ip_address, user_agent, metadata, created_at
+      FROM audit_logs
+      ${whereSql}
+      ORDER BY created_at DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+    `;
+    const listParams = params.concat([safeLimit, safeOffset]);
+    const listRes = await pool.query(listSql, listParams);
+
+    res.json({
+      total: countRes.rows[0]?.total || 0,
+      limit: safeLimit,
+      offset: safeOffset,
+      rows: listRes.rows || []
+    });
+  } catch (err) {
+    console.error('List audit logs error', err);
+    res.status(500).json({ error: 'Failed to list audit logs' });
   }
 });
 
