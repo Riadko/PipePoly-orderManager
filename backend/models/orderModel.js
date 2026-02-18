@@ -1,14 +1,25 @@
 const pool = require('../config/db');
 
+// Helper select that returns items (from orders.items JSONB or aggregated order_items)
+const ORDERS_WITH_ITEMS_SELECT = `
+SELECT o.*, COALESCE(o.items, oi.items_json) AS items
+FROM orders o
+LEFT JOIN (
+  SELECT order_id, jsonb_agg(jsonb_build_object('product', product, 'quantity', quantity)) AS items_json
+  FROM order_items GROUP BY order_id
+) oi ON oi.order_id = o.id
+`;
+
 // Get all orders
 const getAllOrders = async () => {
-  const result = await pool.query('SELECT * FROM orders');
+  const result = await pool.query(ORDERS_WITH_ITEMS_SELECT);
   return result.rows;
 };
 
 // Get orders by status
 const getOrdersByStatus = async (validated, finished) => {
-  const result = await pool.query('SELECT * FROM orders WHERE validated = $1 AND finished = $2', [validated, finished]);
+  const sql = ORDERS_WITH_ITEMS_SELECT + ' WHERE o.validated = $1 AND o.finished = $2';
+  const result = await pool.query(sql, [validated, finished]);
   return result.rows;
 };
 
