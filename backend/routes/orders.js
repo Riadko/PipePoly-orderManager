@@ -332,7 +332,7 @@ async function buildOrderPdfBuffer(order, items) {
                 doc.text(it.flanged ? 'Oui' : 'Non', xBrid + 6, textY, { width: wBrid - 12 });
 
                 // TYPE BRIDE
-                doc.text(String(it.flange_type || '—'), xType + 6, textY, { width: wType - 12 });
+                doc.text(it.flanged ? String(it.flange_type || '') : '', xType + 6, textY, { width: wType - 12 });
 
                 // QTÉ (center)
                 doc.text(String(it.quantity || ''), xQty + 2, textY, { width: wQty - 4, align: 'center' });
@@ -1190,6 +1190,11 @@ router.post('/:id/finish-report', authRequired, requirePermissions(['orders.fini
         const usageRows = usageRes.rows || [];
         const originalUsed = usageRows.reduce((s, r) => s + Number(r.qty || 0), 0);
 
+        // Detect if this order contains "Pièce spéciale" to allow manual tube selection at finish stage
+        const orderItemsRes = await client.query('SELECT product FROM order_items WHERE order_id = $1', [id]);
+        const orderItems = orderItemsRes.rows || [];
+        const hasSpecialPiece = orderItems.some(it => isSpecialPieceName(it.product));
+
         // Optional: user-entered used quantity
         const usedEnteredRaw = req.body && req.body.used_quantity !== undefined ? String(req.body.used_quantity) : null;
         const usedEntered = usedEnteredRaw !== null && usedEnteredRaw !== '' ? Number(usedEnteredRaw) : null;
@@ -1211,11 +1216,40 @@ router.post('/:id/finish-report', authRequired, requirePermissions(['orders.fini
             for (const d of usedDetails) {
                 const invId = Number(d.inventory_id);
                 const row = usageRows.find(r => Number(r.inventory_id) === invId);
-                // Only adjust existing tube usages for this order
-                if (!row) continue;
-                const originalForItem = Number(row.qty || 0);
                 const enteredForItem = Number(d.used_entered);
                 if (Number.isNaN(enteredForItem)) continue;
+
+                // For "Pièce spéciale", allow adding manual tube usage even when no initial movement exists
+                if (!row && hasSpecialPiece) {
+                    if (enteredForItem <= 0) continue;
+
+                    const invRes = await client.query('SELECT id, total_quantity, name, unit FROM inventory WHERE id = $1 FOR UPDATE', [invId]);
+                    const inv = invRes.rows[0];
+                    if (!inv) {
+                        await client.query('ROLLBACK');
+                        return res.status(404).json({ error: `Inventory item not found for manual usage (id=${invId})` });
+                    }
+                    if (!String(inv.name || '').toLowerCase().includes('tube')) {
+                        await client.query('ROLLBACK');
+                        return res.status(400).json({ error: `Selected inventory is not a tube (id=${invId})` });
+                    }
+                    if (Number(inv.total_quantity || 0) < enteredForItem) {
+                        await client.query('ROLLBACK');
+                        return res.status(400).json({ error: `Stock insuffisant pour ${inv.name}` });
+                    }
+
+                    const newTotal = Number(inv.total_quantity) - enteredForItem;
+                    await client.query('UPDATE inventory SET total_quantity = $1 WHERE id = $2', [newTotal, inv.id]);
+                    await client.query(
+                        'INSERT INTO stock_movements (inventory_id, segment_id, order_id, movement_type, quantity, unit, reason) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+                        [inv.id, null, order.id, 'out', enteredForItem, inv.unit || null, `Consommation manuelle (Pièce spéciale) #${order.order_number}`]
+                    );
+                    continue;
+                }
+
+                // For regular orders, keep existing behavior: adjust only known tube usages
+                if (!row) continue;
+                const originalForItem = Number(row.qty || 0);
                 const diffItem = enteredForItem - originalForItem;
                 if (diffItem === 0) continue;
 

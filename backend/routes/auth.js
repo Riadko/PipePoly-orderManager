@@ -94,6 +94,76 @@ router.get('/me', authRequired, async (req, res) => {
   });
 });
 
+// POST /auth/logout
+router.post('/logout', authRequired, async (req, res) => {
+  try {
+    await logAudit({
+      action: 'auth.logout',
+      entityType: 'user',
+      entityId: req.auth.user.id,
+      actorUserId: req.auth.user.id,
+      actorEmail: req.auth.user.email,
+      actorRoles: req.auth.roles,
+      metadata: { email: req.auth.user.email },
+      ...getAuditContext(req)
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Logout error', err);
+    res.status(500).json({ error: 'Logout failed' });
+  }
+});
+
+// POST /auth/change-password
+router.post('/change-password', authRequired, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body || {};
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ error: 'oldPassword and newPassword required' });
+    }
+
+    const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [req.auth.user.id]);
+    const user = userRes.rows[0];
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    const ok = await bcrypt.compare(String(oldPassword), user.password_hash);
+    if (!ok) {
+      await logAudit({
+        action: 'auth.password_change.failed',
+        entityType: 'user',
+        entityId: req.auth.user.id,
+        actorUserId: req.auth.user.id,
+        actorEmail: req.auth.user.email,
+        actorRoles: req.auth.roles,
+        metadata: { reason: 'invalid_old_password' },
+        ...getAuditContext(req)
+      });
+      return res.status(401).json({ error: 'Invalid current password' });
+    }
+
+    const newHash = await bcrypt.hash(String(newPassword), 10);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, req.auth.user.id]);
+
+    await logAudit({
+      action: 'auth.password_change.success',
+      entityType: 'user',
+      entityId: req.auth.user.id,
+      actorUserId: req.auth.user.id,
+      actorEmail: req.auth.user.email,
+      actorRoles: req.auth.roles,
+      metadata: { email: req.auth.user.email },
+      ...getAuditContext(req)
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Change password error', err);
+    res.status(500).json({ error: 'Password change failed' });
+  }
+});
+
 // Admin: list users
 router.get('/users', authRequired, requirePermissions(['users.manage']), async (req, res) => {
   try {
@@ -369,6 +439,104 @@ router.get('/audit-logs', authRequired, requirePermissions(['permissions.manage'
   } catch (err) {
     console.error('List audit logs error', err);
     res.status(500).json({ error: 'Failed to list audit logs' });
+  }
+});
+
+// GET /auth/audit-logs/export (CSV export)
+router.get('/audit-logs/export', authRequired, requirePermissions(['permissions.manage']), async (req, res) => {
+  try {
+    const {
+      action,
+      entity_type,
+      entity_id,
+      actor_email,
+      from,
+      to
+    } = req.query || {};
+
+    const clauses = [];
+    const params = [];
+
+    if (action) {
+      params.push(`%${String(action)}%`);
+      clauses.push(`action ILIKE $${params.length}`);
+    }
+    if (entity_type) {
+      params.push(`%${String(entity_type)}%`);
+      clauses.push(`entity_type ILIKE $${params.length}`);
+    }
+    if (entity_id) {
+      params.push(`%${String(entity_id)}%`);
+      clauses.push(`entity_id ILIKE $${params.length}`);
+    }
+    if (actor_email) {
+      params.push(`%${String(actor_email).toLowerCase()}%`);
+      clauses.push(`LOWER(actor_email) ILIKE $${params.length}`);
+    }
+
+    const fromDate = from ? new Date(from) : null;
+    if (fromDate && !Number.isNaN(fromDate.getTime())) {
+      params.push(fromDate);
+      clauses.push(`created_at >= $${params.length}`);
+    }
+
+    const toDate = to ? new Date(to) : null;
+    if (toDate && !Number.isNaN(toDate.getTime())) {
+      params.push(toDate);
+      clauses.push(`created_at <= $${params.length}`);
+    }
+
+    const whereSql = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    const exportSql = `
+      SELECT id, action, entity_type, entity_id, actor_user_id, actor_email, actor_roles,
+             ip_address, user_agent, metadata, created_at
+      FROM audit_logs
+      ${whereSql}
+      ORDER BY created_at DESC
+    `;
+    const exportRes = await pool.query(exportSql, params);
+    const rows = exportRes.rows || [];
+
+    // Convert to CSV
+    const headers = ['ID', 'Timestamp', 'Action', 'Entity Type', 'Entity ID', 
+             'Actor Email', 'Actor Roles', 'IP Address', 'Device', 'Location', 'User Agent', 'Metadata'];
+    const csvRows = [headers.map(h => `"${h}"`).join(',')];
+
+    rows.forEach(row => {
+      const timestamp = row.created_at ? new Date(row.created_at).toISOString() : '';
+      const rolesStr = Array.isArray(row.actor_roles) ? row.actor_roles.join(';') : '';
+      const deviceStr = row?.metadata?.connection?.device?.label || '';
+      const locationStr = row?.metadata?.connection?.location?.label || '';
+      const metaStr = row.metadata ? JSON.stringify(row.metadata).replace(/"/g, '""') : '';
+      
+      const csvRow = [
+        `"${row.id}"`,
+        `"${timestamp}"`,
+        `"${String(row.action || '').replace(/"/g, '""')}"`,
+        `"${String(row.entity_type || '').replace(/"/g, '""')}"`,
+        `"${String(row.entity_id || '').replace(/"/g, '""')}"`,
+        `"${String(row.actor_email || '').replace(/"/g, '""')}"`,
+        `"${rolesStr.replace(/"/g, '""')}"`,
+        `"${String(row.ip_address || '').replace(/"/g, '""')}"`,
+        `"${String(deviceStr).replace(/"/g, '""')}"`,
+        `"${String(locationStr).replace(/"/g, '""')}"`,
+        `"${String(row.user_agent || '').replace(/"/g, '""')}"`,
+        `"${metaStr}"`
+      ].join(',');
+      csvRows.push(csvRow);
+    });
+
+    const csv = csvRows.join('\n');
+    const timestamp = new Date().toISOString().split('T')[0];
+    const filename = `audit-logs-${timestamp}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+  } catch (err) {
+    console.error('Export audit logs error', err);
+    res.status(500).json({ error: 'Failed to export audit logs' });
   }
 });
 

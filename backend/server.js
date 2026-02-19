@@ -7,6 +7,7 @@ const authRoutes = require('./routes/auth');
 // const productsRoutes = require('./routes/products');
 const catalogProductsRoutes = require('./routes/catalogProducts');
 const clientsRoutes = require('./routes/clients');
+const { cleanupOldAuditLogs } = require('./utils/audit');
 
 require('dotenv').config();
 
@@ -33,4 +34,28 @@ app.get('*', (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  
+  // Audit log retention cleanup
+  const retentionDays = parseInt(process.env.AUDIT_LOG_RETENTION_DAYS || '90', 10);
+  
+  // Run cleanup on startup
+  cleanupOldAuditLogs(retentionDays);
+  
+  // Run cleanup daily at 2:00 AM
+  const scheduleCleanup = () => {
+    const now = new Date();
+    const next2Am = new Date(now);
+    next2Am.setHours(2, 0, 0, 0);
+    if (next2Am <= now) {
+      next2Am.setDate(next2Am.getDate() + 1);
+    }
+    const delay = next2Am.getTime() - now.getTime();
+    setTimeout(() => {
+      cleanupOldAuditLogs(retentionDays);
+      scheduleCleanup(); // Reschedule for next day
+    }, delay);
+  };
+  scheduleCleanup();
+});
